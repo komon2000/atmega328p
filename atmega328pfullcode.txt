@@ -1,0 +1,2678 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// ====================== REQUIRED SYSTEM HEADERS ======================
+#include <stdint.h>       // uint8_t, uint16_t, etc.
+#include <avr/io.h>
+#include <avr/pgmspace.h> // PROGMEM
+#include <avr/wdt.h>      // WDTO_15MS etc.
+
+// ====================== SYSTEM CLOCK ======================
+#define BASE_F_CPU 16000000UL
+#define DEFAULT_CLOCK_DIV CLK_DIV_1
+#define F_CPU 16000000UL
+#define BAUD_RATE 9600
+
+// ====================== ADC SETTINGS ======================
+#define ADC_PRESCALER_128
+#define ADC_REF_AVCC
+
+// ====================== GPIO SETTINGS ======================
+#define LED_PIN 13
+#define BUTTON_PIN 2
+
+// ====================== SPI SETTINGS ======================
+#define SPI_SS_PIN 10
+#define SPI_MODE 0
+#define SPI_SPEED_DIV_16
+
+// ====================== I2C / TWI SETTINGS ======================
+#define I2C_SPEED_100KHZ
+//#define I2C_SPEED_400KHZ
+
+// ====================== ANALOG COMPARATOR SETTINGS ======================
+#define COMPARATOR_MODE_AIN0_VS_AIN1
+//#define COMPARATOR_MODE_AIN0_VS_BANDGAP
+
+// ====================== TIMER SETTINGS ======================
+#define TIMER1_PRESCALER_64
+//#define TIMER1_PRESCALER_8
+//#define TIMER1_PRESCALER_1
+
+#define TIMER2_PRESCALER_64
+//#define TIMER2_USE_ASYNC
+
+// ====================== EXTERNAL INTERRUPTS ======================
+#define BUTTON2_PIN 4
+
+// ====================== EEPROM SETTINGS ======================
+#define EEPROM_BOOT_COUNT_ADDR 0x00
+#define EEPROM_MAGIC_ADDR 0x02
+#define EEPROM_MAGIC_VALUE 0x55
+
+// ====================== WATCHDOG TIMER ======================
+#define WATCHDOG_TIMEOUT_2S
+
+// ====================== SLEEP MODES ======================
+#define SLEEP_MODE_POWER_DOWN
+//#define SLEEP_MODE_IDLE
+
+// ====================== BROWN-OUT DETECTION ======================
+#define BOD_2V7
+
+// ====================== FREE-RUNNING ADC ======================
+#define FREERUN_CHANNEL 0
+#define FREERUN_PRESCALER_32
+
+// ====================== SOFTWARE UART ======================
+#define SOFTUART_TX_PIN 7
+#define SOFTUART_RX_PIN 8
+#define SOFTUART_BAUD 9600
+
+// ====================== BUTTON DEBOUNCER ======================
+#define DEBOUNCE_TIME_MS 25
+
+// ====================== TASK SCHEDULER ======================
+#define MAX_TASKS 12
+
+// ====================== RING BUFFER ======================
+#define RINGBUFFER_SIZE 128
+
+// ====================== BOOTLOADER CONTROL ======================
+#define BOOTLOADER_TRIGGER_TIME WDTO_15MS
+
+// ====================== LED STATUS INDICATOR ======================
+#define STATUS_LED_PIN LED_PIN        // uses Arduino pin 13
+
+// ====================== HARDWARE RANDOM ======================
+#define RANDOM_ENTROPY_PIN 7          // A7 — leave unconnected
+
+// ====================== INTERNAL TEMPERATURE SENSOR ======================
+#define TEMP_CAL_OFFSET 324.31f
+#define TEMP_CAL_SLOPE 1.22f
+
+#endif
+
+====== adc_freerun.h ======
+
+#ifndef ADC_FREERUN_H
+#define ADC_FREERUN_H
+
+#include "config.h"
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void adc_freerun_init(void);
+void adc_freerun_start(void);
+void adc_freerun_stop(void);
+uint16_t adc_freerun_get_raw(void);      // instant latest value
+uint16_t adc_freerun_get_mV(void);       // instant mV (5V ref)
+void adc_freerun_attach(void (*callback)(uint16_t raw, uint16_t mV));
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== adc_freerun.c ======
+
+#include "adc_freerun.h"
+#include "config.h"
+#include <avr/interrupt.h>
+
+static void (*adc_callback)(uint16_t, uint16_t) = 0;
+volatile uint16_t adc_freerun_latest = 0;
+
+ISR(ADC_vect)
+{
+    adc_freerun_latest = ADC;               // auto-clears ADIF
+
+    if (adc_callback)
+    {
+        uint16_t mv;
+#if defined(ADC_REF_AVCC)
+        mv = (uint32_t)adc_freerun_latest * 5000UL / 1024UL;
+#elif defined(ADC_REF_1V1)
+        mv = (uint32_t)adc_freerun_latest * 1100UL / 1024UL;
+#else
+        mv = 0;
+#endif
+        adc_callback(adc_freerun_latest, mv);
+    }
+}
+
+void adc_freerun_init(void)
+{
+    // Disable ADC first → safe to change reference/prescaler/ADATE/ADIE
+    ADCSRA &= ~(1 << ADEN);
+
+    // Reference + channel (exactly mirrors adc.c logic)
+#if defined(ADC_REF_AVCC)
+    ADMUX = (1 << REFS0) | (FREERUN_CHANNEL & 0x0F);
+#elif defined(ADC_REF_1V1)
+    ADMUX = (1 << REFS1) | (1 << REFS0) | (FREERUN_CHANNEL & 0x0F);
+#else
+    ADMUX = (FREERUN_CHANNEL & 0x0F);
+#endif
+
+    // Full ADCSRA in one write (ADEN + ADATE + ADIE + chosen prescaler)
+#if defined(FREERUN_PRESCALER_32)
+    ADCSRA = (1<<ADPS2) | (1<<ADPS0) | (1<<ADEN) | (1<<ADATE) | (1<<ADIE);  // /32
+#elif defined(FREERUN_PRESCALER_16)
+    ADCSRA = (1<<ADPS2)               | (1<<ADEN) | (1<<ADATE) | (1<<ADIE);  // /16
+#else
+    ADCSRA = (1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0) | (1<<ADEN)|(1<<ADATE)|(1<<ADIE); // /128 (fallback)
+#endif
+
+    ADCSRB = 0;   // Free-running mode (ADTS = 000)
+}
+
+void adc_freerun_start(void)
+{
+    ADCSRA |= (1 << ADSC);   // kick off the first conversion → free-runs
+}
+
+void adc_freerun_stop(void)
+{
+    ADCSRA &= ~(1 << ADIE);  // stop interrupts (conversions can continue quietly)
+}
+
+uint16_t adc_freerun_get_raw(void)
+{
+    uint16_t val;
+    uint8_t sreg = SREG;
+    cli();
+    val = adc_freerun_latest;
+    SREG = sreg;
+    return val;
+}
+
+uint16_t adc_freerun_get_mV(void)
+{
+#if defined(ADC_REF_AVCC)
+    return (uint32_t)adc_freerun_get_raw() * 5000UL / 1024UL;
+#elif defined(ADC_REF_1V1)
+    return (uint32_t)adc_freerun_get_raw() * 1100UL / 1024UL;
+#else
+    return 0;
+#endif
+}
+
+void adc_freerun_attach(void (*callback)(uint16_t raw, uint16_t mV))
+{
+    adc_callback = callback;
+}
+====== adc.h ======
+
+#ifndef ADC_H
+#define ADC_H
+
+#include <avr/io.h>
+#include <stdint.h>
+#include "config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void     adc_init(void);                    // call once in setup()
+uint16_t adc_read(uint8_t channel);         // returns 0-1023
+uint16_t adc_read_mV(uint8_t channel);      // returns voltage in millivolts (0-5000)
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== adc.c ======
+
+#include "adc.h"
+#include "config.h"
+
+void adc_init(void) {
+    // Set reference voltage
+    #if defined(ADC_REF_AVCC)
+        ADMUX = (1 << REFS0);               // AVCC with external capacitor at AREF
+    #elif defined(ADC_REF_1V1)
+        ADMUX = (1 << REFS1) | (1 << REFS0); // 1.1V internal
+    #else
+        ADMUX = 0;                          // AREF pin
+    #endif
+
+    // Prescaler
+    #if defined(ADC_PRESCALER_128)
+        ADCSRA = (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // /128
+    #else
+        ADCSRA = (1 << ADPS2) | (1 << ADPS1);                // /64 default
+    #endif
+
+    ADCSRA |= (1 << ADEN);                  // enable ADC
+}
+
+uint16_t adc_read(uint8_t channel) {
+    // Select channel (0-7 on Uno/Nano) and clear high bits
+    ADMUX = (ADMUX & 0xF0) | (channel & 0x07);
+
+    ADCSRA |= (1 << ADSC);                  // start single conversion
+
+    while (ADCSRA & (1 << ADSC));           // wait until done
+
+    return ADC;                             // 10-bit result (0-1023)
+}
+
+uint16_t adc_read_mV(uint8_t channel) {
+    uint16_t raw = adc_read(channel);
+#ifdef ADC_REF_AVCC
+    return (uint32_t)raw * 5000UL / 1024UL;
+#else
+    return (uint32_t)raw * 1100UL / 1024UL;
+#endif
+}
+
+====== bod.h ======
+
+#ifndef BOD_H
+#define BOD_H
+
+#include "config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void bod_init(void);
+void bod_disable(void);           // Use before deep sleep for extra power saving
+void bod_enable(void);
+uint8_t was_brown_out_reset(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== bod.c ======
+
+#include "bod.h"
+#include "config.h"
+#include <avr/io.h>
+
+void bod_init(void) {
+    MCUSR = 0;                    // Clear all reset flags (including BORF)
+}
+
+void bod_disable(void) {
+    MCUCR |= (1 << BODS) | (1 << BODSE);   // Start disable sequence
+    MCUCR &= ~(1 << BODSE);
+    MCUCR |= (1 << BODS);                  // BOD off
+}
+
+void bod_enable(void) {
+    MCUCR |= (1 << BODS) | (1 << BODSE);
+    MCUCR &= ~(1 << BODSE);
+    MCUCR &= ~(1 << BODS);                 // BOD on
+}
+
+uint8_t was_brown_out_reset(void) {
+    return (MCUSR & (1 << BORF)) ? 1 : 0;
+}
+
+====== bootloader.h ======
+
+#ifndef BOOTLOADER_H
+#define BOOTLOADER_H
+
+#include "config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void bootloader_jump(void);           // Restart into bootloader for new sketch upload
+void bootloader_print_info(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== bootloader.c ======
+
+#include "bootloader.h"
+#include "uart.h"
+#include <avr/wdt.h>
+#include <avr/interrupt.h>   // ← REQUIRED for cli()
+#include <util/delay.h>
+#include "config.h"
+
+void bootloader_jump(void)
+{
+    uart_puts_P(PSTR("\n\n>>> JUMPING TO BOOTLOADER <<<\n"));
+    uart_puts_P(PSTR("Please start firmware upload now in Arduino IDE...\n"));
+    _delay_ms(200);
+
+    cli();                                   // Disable all interrupts
+    wdt_enable(BOOTLOADER_TRIGGER_TIME);     // Short watchdog timeout
+    while(1);                                // Wait for watchdog reset
+}
+
+void bootloader_print_info(void)
+{
+    uart_puts_P(PSTR("Bootloader Control active (Optiboot 512-byte compatible)\n"));
+    uart_puts_P(PSTR("Call bootloader_jump() anytime to enter programming mode.\n"));
+}
+
+====== clock.h ======
+
+#ifndef CLOCK_H
+#define CLOCK_H
+
+#include <avr/io.h>
+#include <stdint.h>
+#include "config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void clock_init(void);                    // Call VERY early in setup()
+void clock_set_prescaler(uint8_t div);    // Change speed on the fly
+uint32_t clock_get_frequency(void);       // Returns current CPU frequency in Hz
+
+// Prescaler options (safe & common)
+#define CLK_DIV_1     0
+#define CLK_DIV_2     1
+#define CLK_DIV_4     2
+#define CLK_DIV_8     3
+#define CLK_DIV_16    4
+#define CLK_DIV_32    5
+#define CLK_DIV_64    6
+#define CLK_DIV_128   7
+#define CLK_DIV_256   8
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== clock.c ======
+
+#include "clock.h"
+#include "config.h"
+#include <avr/interrupt.h>   // ← REQUIRED for cli() and SREG
+
+void clock_init(void)
+{
+    clock_set_prescaler(DEFAULT_CLOCK_DIV);
+}
+
+void clock_set_prescaler(uint8_t div)
+{
+    if (div > 8) div = 8;               // safety clamp
+
+    uint8_t oldSREG = SREG;
+    cli();                              // disable interrupts while changing
+
+    CLKPR = (1 << CLKPCE);              // Enable prescaler change
+    CLKPR = div;                        // Set new divider
+
+    SREG = oldSREG;                     // restore interrupts
+}
+
+uint32_t clock_get_frequency(void)
+{
+    uint8_t div = CLKPR & 0x0F;
+    uint32_t freq = BASE_F_CPU;
+    if (div >= 1) {
+        freq >>= div;                   // fast divide by 2^div
+    }
+    return freq;
+}
+
+====== comparator.h ======
+
+#ifndef COMPARATOR_H
+#define COMPARATOR_H
+
+#include <avr/io.h>
+#include <stdint.h>
+#include "config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void comparator_init(void);
+uint8_t comparator_read(void);   // Returns 1 when positive input > negative input
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== comparator.c ======
+
+#include "comparator.h"
+#include "config.h"
+
+void comparator_init(void)
+{
+    // Disable digital input buffers on AIN0/AIN1 (power saving + cleaner analog signal)
+    DIDR1 |= (1 << AIN0D) | (1 << AIN1D);
+
+    // Disable comparator and clear any pending interrupt flag while configuring
+    uint8_t acsr = (1 << ACD) | (1 << ACI);
+
+#ifdef COMPARATOR_MODE_AIN0_VS_BANDGAP
+    acsr |= (1 << ACBG);              // Negative input = 1.1V internal bandgap
+    // Positive input = AIN0
+#else
+    // Default mode (COMPARATOR_MODE_AIN0_VS_AIN1 defined):
+    // Positive input = AIN0, Negative input = AIN1
+    // ACBG stays cleared
+#endif
+
+    ACSR = acsr;          // Write configuration (still disabled)
+    ACSR &= ~(1 << ACD);  // Enable the comparator
+}
+
+uint8_t comparator_read(void)
+{
+    return (ACSR & (1 << ACO)) ? 1 : 0;  // ACO = 1 when (+) > (-)
+}
+
+ ====== crc.h ======
+
+ #ifndef CRC_H
+#define CRC_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * CRC-16-CCITT (polynomial 0x1021, non-reflected)
+ * - Initial value: 0xFFFF
+ * - Final XOR: 0x0000
+ * - Table-driven, stored in flash (PROGMEM)
+ */
+uint16_t crc16_init(void);
+uint16_t crc16_update(uint16_t crc, uint8_t byte);
+uint16_t crc16(const uint8_t* data, uint16_t length); // convenience wrapper
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+====== crc.c ======
+
+#include "crc.h"
+#include <avr/pgmspace.h>
+
+static const uint16_t crc16_table[256] PROGMEM = {
+    0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7,
+    0x8108, 0x9129, 0xA14A, 0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
+    0x1231, 0x0210, 0x3273, 0x2252, 0x52B5, 0x4294, 0x72F7, 0x62D6,
+    0x9339, 0x8318, 0xB37B, 0xA35A, 0xD3BD, 0xC39C, 0xF3FF, 0xE3DE,
+    0x2462, 0x3443, 0x0420, 0x1401, 0x64E6, 0x74C7, 0x44A4, 0x5485,
+    0xA56A, 0xB54B, 0x8528, 0x9509, 0xE5EE, 0xF5CF, 0xC5AC, 0xD58D,
+    0x3653, 0x2672, 0x1611, 0x0630, 0x76D7, 0x66F6, 0x5695, 0x46B4,
+    0xB75B, 0xA77A, 0x9719, 0x8738, 0xF7DF, 0xE7FE, 0xD79D, 0xC7BC,
+    0x48C4, 0x58E5, 0x6886, 0x78A7, 0x0840, 0x1861, 0x2802, 0x3823,
+    0xC9CC, 0xD9ED, 0xE98E, 0xF9AF, 0x8948, 0x9969, 0xA90A, 0xB92B,
+    0x5AF5, 0x4AD4, 0x7AB7, 0x6A96, 0x1A71, 0x0A50, 0x3A33, 0x2A12,
+    0xDBFD, 0xCBDC, 0xFBBF, 0xEB9E, 0x9B79, 0x8B58, 0xBB3B, 0xAB1A,
+    0x6CA6, 0x7C87, 0x4CE4, 0x5CC5, 0x2C22, 0x3C03, 0x0C60, 0x1C41,
+    0xEDAE, 0xFD8F, 0xCDEC, 0xDDCD, 0xAD2A, 0xBD0B, 0x8D68, 0x9D49,
+    0x7E97, 0x6EB6, 0x5ED5, 0x4EF4, 0x3E13, 0x2E32, 0x1E51, 0x0E70,
+    0xFF9F, 0xEFBE, 0xDFDD, 0xCFFC, 0xBF1B, 0xAF3A, 0x9F59, 0x8F78,
+    0x9188, 0x81A9, 0xB1CA, 0xA1EB, 0xD10C, 0xC12D, 0xF14E, 0xE16F,
+    0x1080, 0x00A1, 0x30C2, 0x20E3, 0x5004, 0x4025, 0x7046, 0x6067,
+    0x83B9, 0x9398, 0xA3FB, 0xB3DA, 0xC33D, 0xD31C, 0xE37F, 0xF35E,
+    0x02B1, 0x1290, 0x22F3, 0x32D2, 0x4235, 0x5214, 0x6277, 0x7256,
+    0xB5EA, 0xA5CB, 0x95A8, 0x8589, 0xF56E, 0xE54F, 0xD52C, 0xC50D,
+    0x34E2, 0x24C3, 0x14A0, 0x0481, 0x7466, 0x6447, 0x5424, 0x4405,
+    0xA7DB, 0xB7FA, 0x8799, 0x97B8, 0xE75F, 0xF77E, 0xC71D, 0xD73C,
+    0x26D3, 0x36F2, 0x0691, 0x16B0, 0x6657, 0x7676, 0x4615, 0x5634,
+    0xD94C, 0xC96D, 0xF90E, 0xE92F, 0x99C8, 0x89E9, 0xB98A, 0xA9AB,
+    0x5844, 0x4865, 0x7806, 0x6827, 0x18C0, 0x08E1, 0x3882, 0x28A3,
+    0xCB7D, 0xDB5C, 0xEB3F, 0xFB1E, 0x8BF9, 0x9BD8, 0xABBB, 0xBB9A,
+    0x4A75, 0x5A54, 0x6A37, 0x7A16, 0x0AF1, 0x1AD0, 0x2AB3, 0x3A92,
+    0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9,
+    0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
+    0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8,
+    0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
+};
+
+uint16_t crc16_init(void)
+{
+    return 0xFFFF;
+}
+
+uint16_t crc16_update(uint16_t crc, uint8_t byte)
+{
+    uint8_t idx = (crc >> 8) ^ byte;
+    return (crc << 8) ^ pgm_read_word(&crc16_table[idx]);
+}
+
+uint16_t crc16(const uint8_t* data, uint16_t length)
+{
+    uint16_t crc = crc16_init();
+    for (uint16_t i = 0; i < length; i++) {
+        crc = crc16_update(crc, data[i]);
+    }
+    return crc;                    // final XOR = 0x0000 for this variant
+}
+
+====== debounce.h ======
+
+#ifndef DEBOUNCE_H
+#define DEBOUNCE_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void debounce_init(void);
+void debounce_add(uint8_t pin, uint8_t active_low); // active_low = 1 if button pulls to GND
+void debounce_update(void);                         // Call regularly (e.g. every 1-5 ms)
+uint8_t debounce_is_pressed(uint8_t pin);           // Current stable state (level)
+uint8_t debounce_was_pressed(uint8_t pin);          // One-shot rising edge (true only once)
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== debounce.c ======
+
+#include "debounce.h"
+#include "gpio.h"      // for gpio_read()
+#include "timer00.h"   // for millis() — rename to millis.h if you prefer
+#include "config.h"
+
+#define MAX_BUTTONS 8
+
+typedef struct {
+    uint8_t  pin;
+    uint8_t  active_low;
+    uint8_t  stable_state;
+    uint8_t  prev_state;      // for clean one-shot rising-edge detection
+    uint32_t last_change;
+} debounce_t;
+
+static debounce_t buttons[MAX_BUTTONS];
+static uint8_t button_count = 0;
+
+void debounce_init(void)
+{
+    button_count = 0;
+}
+
+void debounce_add(uint8_t pin, uint8_t active_low)
+{
+    if (button_count >= MAX_BUTTONS) return;
+
+    debounce_t *b = &buttons[button_count];
+
+    b->pin         = pin;
+    b->active_low  = active_low;
+    b->last_change = millis();
+
+    // Initial sample to prevent false edge on first update/was_pressed
+    uint8_t raw = gpio_read(pin);
+    b->stable_state = b->prev_state = active_low ? (raw == LOW) : (raw == HIGH);
+
+    button_count++;
+}
+
+void debounce_update(void)
+{
+    uint32_t now = millis();
+
+    for (uint8_t i = 0; i < button_count; i++)
+    {
+        debounce_t *b = &buttons[i];
+
+        uint8_t raw     = gpio_read(b->pin);
+        uint8_t current = b->active_low ? (raw == LOW) : (raw == HIGH);
+
+        if (current != b->stable_state)
+        {
+            // Potential bounce — wait full debounce period
+            if (now - b->last_change >= DEBOUNCE_TIME_MS)
+            {
+                b->stable_state = current;
+                b->last_change  = now;
+            }
+        }
+        else
+        {
+            // Stable — keep resetting the timer
+            b->last_change = now;
+        }
+    }
+}
+
+uint8_t debounce_is_pressed(uint8_t pin)
+{
+    for (uint8_t i = 0; i < button_count; i++) {
+        if (buttons[i].pin == pin) {
+            return buttons[i].stable_state;
+        }
+    }
+    return 0;
+}
+
+uint8_t debounce_was_pressed(uint8_t pin)
+{
+    for (uint8_t i = 0; i < button_count; i++) {
+        if (buttons[i].pin == pin) {
+            uint8_t was = (buttons[i].prev_state == 0 && buttons[i].stable_state == 1);
+            buttons[i].prev_state = buttons[i].stable_state;
+            return was;
+        }
+    }
+    return 0;
+}
+
+====== eeprom.h ======
+
+#ifndef EEPROM_H
+#define EEPROM_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void     eeprom_init(void);
+
+uint16_t eeprom_get_boot_count(void);
+void     eeprom_increment_boot_count(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== eeprom.c ======
+
+#include "eeprom.h"
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include "config.h"
+
+// ====================== INTERNAL LOW-LEVEL (no name conflict) ======================
+static void eeprom_write_byte(uint16_t addr, uint8_t data)
+{
+    while (EECR & (1 << EEPE));
+    uint8_t sreg = SREG;
+    cli();
+    EEAR = addr;
+    EEDR = data;
+    EECR = (1 << EEMPE);
+    EECR |= (1 << EEPE);
+    SREG = sreg;
+}
+
+static uint8_t eeprom_read_byte(uint16_t addr)
+{
+    while (EECR & (1 << EEPE));
+    EEAR = addr;
+    EECR |= (1 << EERE);
+    return EEDR;
+}
+
+static void eeprom_write_word(uint16_t addr, uint16_t data)
+{
+    eeprom_write_byte(addr, (uint8_t)data);
+    eeprom_write_byte(addr + 1, (uint8_t)(data >> 8));
+}
+
+static uint16_t eeprom_read_word(uint16_t addr)
+{
+    return ((uint16_t)eeprom_read_byte(addr + 1) << 8) | eeprom_read_byte(addr);
+}
+
+// ====================== PUBLIC HIGH-LEVEL API ======================
+void eeprom_init(void)
+{
+    if (eeprom_read_byte(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) {
+        eeprom_write_word(EEPROM_BOOT_COUNT_ADDR, 0);
+        eeprom_write_byte(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
+    }
+}
+
+uint16_t eeprom_get_boot_count(void)
+{
+    if (eeprom_read_byte(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_VALUE) return 0;
+    return eeprom_read_word(EEPROM_BOOT_COUNT_ADDR);
+}
+
+void eeprom_increment_boot_count(void)
+{
+    uint16_t count = eeprom_get_boot_count() + 1;
+    eeprom_write_word(EEPROM_BOOT_COUNT_ADDR, count);
+    eeprom_write_byte(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
+}
+
+====== extint.h ======
+
+#ifndef EXTINT_H
+#define EXTINT_H
+
+#include <stdint.h>
+#include "config.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define EXTINT_LOW      0
+#define EXTINT_CHANGE   1
+#define EXTINT_FALLING  2
+#define EXTINT_RISING   3
+
+#define EXTINT0         0   // Pin 2
+#define EXTINT1         1   // Pin 3
+
+void extint_init(void);
+void extint_attach(uint8_t num, uint8_t mode, void (*callback)(void));
+void extint_detach(uint8_t num);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
+
+====== extint.c ======
+
+#include "extint.h"
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include "config.h"
+
+// Callbacks accessed from ISR → must be volatile
+static void (*volatile extint0_callback)(void) = 0;
+static void (*volatile extint1_callback)(void) = 0;
+
+void extint_init(void)
+{
+    uint8_t sreg = SREG;
+    cli();
+
+    EIMSK &= ~((1 << INT0) | (1 << INT1));     // disable both
+    EIFR  |=  (1 << INTF0) | (1 << INTF1);     // clear any pending flags
+    extint0_callback = 0;
+    extint1_callback = 0;
+
+    SREG = sreg;
+}
+
+void extint_attach(uint8_t num, uint8_t mode, void (*callback)(void))
+{
+    if (mode > EXTINT_RISING) return;   // invalid mode safety
+
+    uint8_t sreg = SREG;
+    cli();
+
+    if (num == EXTINT0)
+    {
+        extint0_callback = callback;
+
+        // Set ISC01:ISC00 (bits 1:0)
+        EICRA = (EICRA & ~0x03) | ((uint8_t)mode << ISC00);
+
+        EIFR |= (1 << INTF0);               // clear pending flag
+
+        if (callback)
+            EIMSK |= (1 << INT0);
+        else
+            EIMSK &= ~(1 << INT0);
+    }
+    else if (num == EXTINT1)
+    {
+        extint1_callback = callback;
+
+        // Set ISC11:ISC10 (bits 3:2)
+        EICRA = (EICRA & ~0x0C) | ((uint8_t)mode << ISC10);
+
+        EIFR |= (1 << INTF1);               // clear pending flag
+
+        if (callback)
+            EIMSK |= (1 << INT1);
+        else
+            EIMSK &= ~(1 << INT1);
+    }
+
+    SREG = sreg;
+}
+
+void extint_detach(uint8_t num)
+{
+    uint8_t sreg = SREG;
+    cli();
+
+    if (num == EXTINT0)
+    {
+        EIMSK &= ~(1 << INT0);
+        EIFR  |=  (1 << INTF0);
+        extint0_callback = 0;
+    }
+    else if (num == EXTINT1)
+    {
+        EIMSK &= ~(1 << INT1);
+        EIFR  |=  (1 << INTF1);
+        extint1_callback = 0;
+    }
+
+    SREG = sreg;
+}
+
+// ====================== ISRs ======================
+
+ISR(INT0_vect)
+{
+    if (extint0_callback) extint0_callback();
+}
+
+ISR(INT1_vect)
+{
+    if (extint1_callback) extint1_callback();
+}
+
+====== gpio.h ======
+
+#ifndef GPIO_H
+#define GPIO_H
+#include <avr/io.h>
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Arduino Uno / Nano compatible pin numbers
+// 0-7   → PORTD (PD0-PD7)
+// 8-13  → PORTB (PB0-PB5)
+// 14-19 → PORTC (PC0-PC5 / A0-A5)
+
+#define INPUT        0
+#define OUTPUT       1
+#define INPUT_PULLUP 2
+
+#define LOW          0
+#define HIGH         1
+
+void gpio_init(void);                  // Call early in setup()
+void gpio_pin_mode(uint8_t pin, uint8_t mode);
+void gpio_write(uint8_t pin, uint8_t val);
+uint8_t gpio_read(uint8_t pin);
+void gpio_toggle(uint8_t pin);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== gpio.c ======
+
+#include "gpio.h"
+
+// ====================== GPIO (Arduino-style pin mapping) ======================
+
+void gpio_init(void)
+{
+    // AVR resets all pins to INPUT (no pull-up) — nothing required here.
+    // This function exists for API consistency with the rest of the library.
+}
+
+void gpio_pin_mode(uint8_t pin, uint8_t mode)
+{
+    if (pin < 8) {                              // PORTD: pins 0-7
+        uint8_t mask = (1 << pin);
+        if (mode == OUTPUT) {
+            DDRD |= mask;
+        } else {
+            DDRD &= ~mask;
+            if (mode == INPUT_PULLUP) PORTD |= mask;
+            else                      PORTD &= ~mask;
+        }
+    }
+    else if (pin < 14) {                        // PORTB: pins 8-13
+        uint8_t mask = (1 << (pin - 8));
+        if (mode == OUTPUT) {
+            DDRB |= mask;
+        } else {
+            DDRB &= ~mask;
+            if (mode == INPUT_PULLUP) PORTB |= mask;
+            else                      PORTB &= ~mask;
+        }
+    }
+    else if (pin < 20) {                        // PORTC: pins 14-19 (A0-A5)
+        uint8_t mask = (1 << (pin - 14));
+        if (mode == OUTPUT) {
+            DDRC |= mask;
+        } else {
+            DDRC &= ~mask;
+            if (mode == INPUT_PULLUP) PORTC |= mask;
+            else                      PORTC &= ~mask;
+        }
+    }
+}
+
+void gpio_write(uint8_t pin, uint8_t val)
+{
+    if (pin < 8) {                              // PORTD
+        if (val) PORTD |=  (1 << pin);
+        else     PORTD &= ~(1 << pin);
+    }
+    else if (pin < 14) {                        // PORTB
+        uint8_t bit = pin - 8;
+        if (val) PORTB |=  (1 << bit);
+        else     PORTB &= ~(1 << bit);
+    }
+    else if (pin < 20) {                        // PORTC
+        uint8_t bit = pin - 14;
+        if (val) PORTC |=  (1 << bit);
+        else     PORTC &= ~(1 << bit);
+    }
+}
+
+uint8_t gpio_read(uint8_t pin)
+{
+    if (pin < 8) {
+        return (PIND & (1 << pin)) ? HIGH : LOW;
+    }
+    else if (pin < 14) {
+        uint8_t bit = pin - 8;
+        return (PINB & (1 << bit)) ? HIGH : LOW;
+    }
+    else if (pin < 20) {
+        uint8_t bit = pin - 14;
+        return (PINC & (1 << bit)) ? HIGH : LOW;
+    }
+    return LOW;                                 // invalid pin
+}
+
+void gpio_toggle(uint8_t pin)
+{
+    // Atomic toggle: writing 1 to the corresponding bit in PINx register toggles PORTx
+    // (single instruction, no read-modify-write, fully interrupt-safe)
+    if (pin < 8) {
+        PIND = (1 << pin);
+    }
+    else if (pin < 14) {
+        PINB = (1 << (pin - 8));
+    }
+    else if (pin < 20) {
+        PINC = (1 << (pin - 14));
+    }
+}
+====== hw_random.h ======
+
+#ifndef HW_RANDOM_H
+#define HW_RANDOM_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Hardware-assisted random number generator
+ * - Seeds from real analog noise on RANDOM_ENTROPY_PIN (leave floating/unconnected)
+ * - Fast xorshift32 PRNG after seeding
+ * - Fully compatible with adc_freerun and normal ADC usage
+ */
+void hw_random_init(void);           // Call early in setup(), before adc_freerun_init()
+
+uint8_t  hw_random8(void);
+uint16_t hw_random16(void);
+uint32_t hw_random32(void);
+uint32_t hw_random_between(uint32_t min, uint32_t max);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== hw_random.c ======
+
+#include "hw_random.h"
+#include "adc.h"           // Uses adc_read() → no conflict with adc_freerun
+#include "timer00.h"       // for millis()
+#include <util/atomic.h>
+#include "config.h"
+
+static uint32_t rand_state = 0xA5A5A5A5UL;
+
+void hw_random_init(void)
+{
+    uint8_t saved_admux = ADMUX;
+
+    // Ensure ADC is enabled (idempotent if adc_freerun already called it)
+    adc_init();
+
+    // Collect high-quality entropy from floating pin + system timing noise
+    uint32_t seed = 0xA5A5A5A5UL;
+    for (uint8_t i = 0; i < 32; i++)
+    {
+        uint16_t noise = adc_read(RANDOM_ENTROPY_PIN);   // 10 bits of real analog noise
+        seed ^= (uint32_t)noise;
+        seed ^= millis();
+    }
+
+    rand_state = seed;
+
+    ADMUX = saved_admux;   // Restore original ADC channel/reference (important!)
+}
+
+static uint32_t xorshift32(void)
+{
+    uint32_t x;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        x = rand_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        rand_state = x;
+    }
+    return x;
+}
+
+uint8_t hw_random8(void)
+{
+    return (uint8_t)xorshift32();
+}
+
+uint16_t hw_random16(void)
+{
+    return (uint16_t)xorshift32();
+}
+
+uint32_t hw_random32(void)
+{
+    return xorshift32();
+}
+
+uint32_t hw_random_between(uint32_t min, uint32_t max)
+{
+    if (min >= max) return min;
+    uint32_t range = max - min;
+    // Unbiased distribution using 64-bit multiplication (no modulo bias)
+    return min + (uint32_t)(((uint64_t)hw_random32() * range) >> 32);
+}
+
+====== i2c.h ======
+
+#ifndef I2C_H
+#define I2C_H
+#include <avr/io.h>
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Hardware TWI (I2C) Master
+ * - 100 kHz or 400 kHz (configurable in config.h)
+ * - Timeout protection on every operation
+ * - High-level register helpers for 95% of sensors/devices
+ */
+void i2c_init(void);
+
+uint8_t i2c_start(uint8_t addr);        // addr = (device << 1) | R/W bit
+void    i2c_stop(void);
+uint8_t i2c_write(uint8_t data);        // 0 = ACK received
+uint8_t i2c_read_ack(void);             // master sends ACK
+uint8_t i2c_read_nack(void);            // master sends NACK (last byte)
+
+// High-level helpers (most common usage)
+uint8_t i2c_write_reg(uint8_t dev_addr, uint8_t reg_addr, uint8_t data);
+uint8_t i2c_read_reg(uint8_t dev_addr, uint8_t reg_addr);   // returns 0xFF on error
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== i2c.c ======
+
+#include "i2c.h"
+#include "config.h"
+
+#define I2C_TIMEOUT  2000   // ~1 ms @ 16 MHz — safe and fast
+
+static uint8_t i2c_wait_twint(void)
+{
+    uint16_t timeout = I2C_TIMEOUT;
+    while (!(TWCR & (1 << TWINT)) && timeout--)
+        ;
+    return (timeout == 0) ? 1 : 0;   // 1 = timeout
+}
+
+void i2c_init(void)
+{
+    TWCR = 0;                        // reset TWI
+
+#if defined(I2C_SPEED_400KHZ)
+    TWBR = 12;                       // 400 kHz @ 16 MHz, prescaler=1
+#else
+    TWBR = 72;                       // 100 kHz @ 16 MHz (most reliable)
+#endif
+    TWSR = 0;                        // prescaler = 1
+    TWCR = (1 << TWEN);              // enable TWI
+}
+
+uint8_t i2c_start(uint8_t addr)
+{
+    TWCR = (1<<TWINT)|(1<<TWSTA)|(1<<TWEN);
+    if (i2c_wait_twint()) return 1;           // timeout
+
+    if ((TWSR & 0xF8) != 0x08) return 2;      // START condition failed
+
+    TWDR = addr;
+    TWCR = (1<<TWINT)|(1<<TWEN);
+    if (i2c_wait_twint()) return 3;
+
+    uint8_t status = TWSR & 0xF8;
+    if (status != 0x18 && status != 0x40)     // SLA+W ACK or SLA+R ACK
+        return 4;
+
+    return 0;
+}
+
+void i2c_stop(void)
+{
+    TWCR = (1<<TWINT)|(1<<TWSTO)|(1<<TWEN);
+    while (TWCR & (1 << TWSTO));              // wait for STOP to complete
+}
+
+uint8_t i2c_write(uint8_t data)
+{
+    TWDR = data;
+    TWCR = (1<<TWINT)|(1<<TWEN);
+    if (i2c_wait_twint()) return 1;
+    return ((TWSR & 0xF8) == 0x28) ? 0 : 2;   // 0 = ACK received
+}
+
+uint8_t i2c_read_ack(void)
+{
+    TWCR = (1<<TWINT)|(1<<TWEA)|(1<<TWEN);
+    if (i2c_wait_twint()) return 0;
+    return TWDR;
+}
+
+uint8_t i2c_read_nack(void)
+{
+    TWCR = (1<<TWINT)|(1<<TWEN);              // no ACK
+    if (i2c_wait_twint()) return 0;
+    return TWDR;
+}
+
+// ====================== High-level helpers ======================
+
+uint8_t i2c_write_reg(uint8_t dev_addr, uint8_t reg_addr, uint8_t data)
+{
+    uint8_t err;
+    if ((err = i2c_start(dev_addr << 1))) return err;
+    if (i2c_write(reg_addr)) { i2c_stop(); return 10; }
+    if (i2c_write(data))     { i2c_stop(); return 11; }
+    i2c_stop();
+    return 0;
+}
+
+uint8_t i2c_read_reg(uint8_t dev_addr, uint8_t reg_addr)
+{
+    uint8_t data = 0xFF;
+
+    if (i2c_start(dev_addr << 1)) goto error;
+    if (i2c_write(reg_addr))      goto error;
+    if (i2c_start((dev_addr << 1) | 1)) goto error;   // repeated start + read
+
+    data = i2c_read_nack();
+    i2c_stop();
+    return data;
+
+error:
+    i2c_stop();
+    return 0xFF;
+}
+
+====== ledstatus.h ======
+
+#ifndef LEDSTATUS_H
+#define LEDSTATUS_H
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Status LED visual indicator
+ * - Uses PWM on STATUS_LED_PIN (pin 13 by default)
+ * - Update called regularly by scheduler (~50 Hz)
+ */
+#define STATUS_OFF        0
+#define STATUS_ON         1
+#define STATUS_BLINK_SLOW 2
+#define STATUS_BLINK_FAST 3
+#define STATUS_BREATHE    4
+#define STATUS_HEARTBEAT  5
+#define STATUS_ERROR      6
+
+void ledstatus_init(void);
+void ledstatus_set(uint8_t mode);
+uint8_t ledstatus_get(void);
+void ledstatus_update(void);   // call from scheduler or main loop (~every 20 ms)
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== ledstatus.c ======
+
+#include "ledstatus.h"
+#include "pwm.h"
+#include "timer00.h"   // millis()
+#include "gpio.h"
+#include "config.h"
+
+static volatile uint8_t current_mode = STATUS_OFF;
+static uint32_t last_update = 0;
+static uint16_t phase = 0;
+
+void ledstatus_init(void)
+{
+    gpio_pin_mode(STATUS_LED_PIN, OUTPUT);
+    pwm_write(STATUS_LED_PIN, 0);
+}
+
+void ledstatus_set(uint8_t mode)
+{
+    if (mode > STATUS_ERROR) mode = STATUS_OFF;   // safety clamp
+
+    current_mode = mode;
+    phase = 0;
+    last_update = millis();
+}
+
+uint8_t ledstatus_get(void)
+{
+    return current_mode;
+}
+
+void ledstatus_update(void)
+{
+    uint32_t now = millis();
+    if (now - last_update < 20) return;   // ~50 Hz update rate
+
+    last_update = now;
+    phase++;
+
+    uint8_t brightness = 0;
+
+    switch (current_mode)
+    {
+        case STATUS_OFF:
+            brightness = 0;
+            break;
+
+        case STATUS_ON:
+            brightness = 255;
+            break;
+
+        case STATUS_BLINK_SLOW:
+            brightness = ((phase % 50) < 25) ? 255 : 0;
+            break;
+
+        case STATUS_BLINK_FAST:
+            brightness = ((phase % 12) < 6) ? 255 : 0;
+            break;
+
+        case STATUS_BREATHE:
+            {
+                // Fast triangle-wave breathing (0 → 255 → 0), ~10 s period
+                uint16_t p = phase & 0x1FF;                 // 0-511
+                brightness = (p < 256) ? (uint8_t)p : (uint8_t)(511 - p);
+            }
+            break;
+
+        case STATUS_HEARTBEAT:
+            brightness = ((phase % 80) < 8) ? 255 : 0;   // sharp pulse
+            break;
+
+        case STATUS_ERROR:
+            {
+                // Double-flash error pattern
+                uint8_t p = phase % 20;
+                brightness = ((p < 4) || (p >= 8 && p < 12)) ? 255 : 0;
+            }
+            break;
+    }
+
+    pwm_write(STATUS_LED_PIN, brightness);
+}
+
+====== pcint.h ======
+
+#ifndef PCINT_H
+#define PCINT_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Pin Change Interrupts (PCINT)
+ * - Any edge on pins 0-19 (Arduino Uno/Nano numbering)
+ * - Only the specific pin that changed triggers its callback
+ * - Works on PORTB, PORTC, PORTD
+ */
+void pcint_init(void);
+void pcint_attach(uint8_t pin, void (*callback)(void));
+void pcint_detach(uint8_t pin);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== pcint.c ======
+
+#include "pcint.h"
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include "config.h"
+
+// Callbacks accessed from ISR → must be volatile
+static void (*volatile pcint_callbacks[20])(void) = {0};
+
+// Previous port states → detect exactly which pin changed
+static uint8_t old_pind = 0;
+static uint8_t old_pinb = 0;
+static uint8_t old_pinc = 0;
+
+void pcint_init(void)
+{
+    uint8_t sreg = SREG;
+    cli();
+
+    PCICR  = 0;                         // disable all groups
+    PCMSK0 = PCMSK1 = PCMSK2 = 0;
+
+    // Clear pending flags
+    PCIFR = (1<<PCIF0) | (1<<PCIF1) | (1<<PCIF2);
+
+    // Capture initial states (prevents spurious callbacks on boot)
+    old_pind = PIND;
+    old_pinb = PINB;
+    old_pinc = PINC;
+
+    for (uint8_t i = 0; i < 20; i++) {
+        pcint_callbacks[i] = 0;
+    }
+
+    SREG = sreg;
+}
+
+void pcint_attach(uint8_t pin, void (*callback)(void))
+{
+    if (pin >= 20) return;
+
+    uint8_t sreg = SREG;
+    cli();
+
+    pcint_callbacks[pin] = callback;
+
+    if (pin < 8) {                          // PORTD (pins 0-7)
+        PCMSK2 |= (1 << pin);
+        PCICR  |= (1 << PCIE2);
+    }
+    else if (pin < 14) {                    // PORTB (pins 8-13)
+        PCMSK0 |= (1 << (pin - 8));
+        PCICR  |= (1 << PCIE0);
+    }
+    else {                                  // PORTC (pins 14-19 / A0-A5)
+        PCMSK1 |= (1 << (pin - 14));
+        PCICR  |= (1 << PCIE1);
+    }
+
+    SREG = sreg;
+}
+
+void pcint_detach(uint8_t pin)
+{
+    if (pin >= 20) return;
+
+    uint8_t sreg = SREG;
+    cli();
+
+    pcint_callbacks[pin] = 0;
+
+    // Smart disable: turn off PCIE only when no pins left on that port
+    if (pin < 8) {                          // PORTD
+        PCMSK2 &= ~(1 << pin);
+        if (PCMSK2 == 0) PCICR &= ~(1 << PCIE2);
+    }
+    else if (pin < 14) {                    // PORTB
+        uint8_t bit = pin - 8;
+        PCMSK0 &= ~(1 << bit);
+        if (PCMSK0 == 0) PCICR &= ~(1 << PCIE0);
+    }
+    else {                                  // PORTC
+        uint8_t bit = pin - 14;
+        PCMSK1 &= ~(1 << bit);
+        if (PCMSK1 == 0) PCICR &= ~(1 << PCIE1);
+    }
+
+    SREG = sreg;
+}
+
+// ====================== ISRs ======================
+
+ISR(PCINT0_vect)   // PORTB — pins 8-13
+{
+    PCIFR |= (1 << PCIF0);                  // acknowledge flag
+    uint8_t changed = PINB ^ old_pinb;
+    old_pinb = PINB;
+
+    for (uint8_t i = 0; i < 6; i++) {
+        if ((changed & (1 << i)) && pcint_callbacks[i + 8]) {
+            pcint_callbacks[i + 8]();
+        }
+    }
+}
+
+ISR(PCINT1_vect)   // PORTC — pins 14-19
+{
+    PCIFR |= (1 << PCIF1);
+    uint8_t changed = PINC ^ old_pinc;
+    old_pinc = PINC;
+
+    for (uint8_t i = 0; i < 6; i++) {
+        if ((changed & (1 << i)) && pcint_callbacks[i + 14]) {
+            pcint_callbacks[i + 14]();
+        }
+    }
+}
+
+ISR(PCINT2_vect)   // PORTD — pins 0-7
+{
+    PCIFR |= (1 << PCIF2);
+    uint8_t changed = PIND ^ old_pind;
+    old_pind = PIND;
+
+    for (uint8_t i = 0; i < 8; i++) {
+        if ((changed & (1 << i)) && pcint_callbacks[i]) {
+            pcint_callbacks[i]();
+        }
+    }
+}
+
+====== pwm.h ======
+
+#ifndef PWM_H
+#define PWM_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Hardware PWM Output (Arduino Uno / Nano compatible)
+ * Supported pins: 3 (OC2B), 5 (OC0B), 6 (OC0A), 9 (OC1A), 10 (OC1B), 11 (OC2A)
+ * Duty cycle: 0–255 (8-bit resolution)
+ * Timer1 uses 10-bit mode internally (0–1020) for higher precision
+ */
+void pwm_init(void);
+void pwm_write(uint8_t pin, uint8_t duty);   // 0–255
+void pwm_disable(uint8_t pin);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== pwm.c ======
+
+#include "pwm.h"
+#include "gpio.h"
+#include "timer00.h"   // Timer0 PWM channels
+#include "timer1.h"    // Timer1 PWM channels (10-bit)
+#include "timer2.h"    // Timer2 PWM channels
+#include "config.h"
+
+static const uint8_t pwm_supported_pins[6] = {3, 5, 6, 9, 10, 11};
+
+void pwm_init(void)
+{
+    // Set all hardware PWM pins to OUTPUT by default (safe & convenient)
+    for (uint8_t i = 0; i < 6; i++) {
+        gpio_pin_mode(pwm_supported_pins[i], OUTPUT);
+    }
+
+    // Underlying timers are initialized by their own *_init() calls
+    // (timer00_init, timer1_init, timer2_init) — called earlier in setup()
+}
+
+void pwm_write(uint8_t pin, uint8_t duty)
+{
+    if (duty > 255) duty = 255;
+
+    switch (pin)
+    {
+        case 3:  timer2_pwmB(duty);                         break; // OC2B  (PD3)
+        case 5:  timer0_pwmB(duty);                         break; // OC0B  (PD5)
+        case 6:  timer0_pwmA(duty);                         break; // OC0A  (PD6)
+        case 9:  timer1_pwmA((uint16_t)duty << 2);          break; // OC1A  (PB1) — 10-bit
+        case 10: timer1_pwmB((uint16_t)duty << 2);          break; // OC1B  (PB2) — 10-bit
+        case 11: timer2_pwmA(duty);                         break; // OC2A  (PB3)
+        default: /* not a PWM pin — ignore silently */      break;
+    }
+}
+
+void pwm_disable(uint8_t pin)
+{
+    pwm_write(pin, 0);   // turns output off cleanly
+}
+
+====== ringbuffer.h ======
+
+#ifndef RINGBUFFER_H
+#define RINGBUFFER_H
+#include <stdint.h>
+#include "config.h"
+
+typedef struct {
+    uint8_t          buffer[RINGBUFFER_SIZE];
+    volatile uint16_t head;
+    volatile uint16_t tail;
+    volatile uint16_t count;
+} RingBuffer;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Lock-free Ring Buffer (Circular FIFO)
+ * - Fully interrupt-safe (ATOMIC_BLOCK)
+ * - Optimized for power-of-two size (128 bytes)
+ * - Ideal for UART, SoftUART, sensor queues, command buffers, etc.
+ */
+void     rb_init(RingBuffer* rb);
+uint8_t  rb_write(RingBuffer* rb, uint8_t data);     // 1 = success
+uint8_t  rb_read(RingBuffer* rb, uint8_t* data);     // 1 = success
+uint16_t rb_available(RingBuffer* rb);               // bytes ready to read
+uint16_t rb_free(RingBuffer* rb);                    // free space
+void     rb_clear(RingBuffer* rb);
+uint8_t  rb_is_full(RingBuffer* rb);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+
+====== ringbuffer.c ======
+
+#include "ringbuffer.h"
+#include <util/atomic.h>
+#include "config.h"
+
+// Fast wrap-around (RINGBUFFER_SIZE must be power of 2)
+#define RB_MASK (RINGBUFFER_SIZE - 1)
+
+void rb_init(RingBuffer* rb)
+{
+    rb->head  = 0;
+    rb->tail  = 0;
+    rb->count = 0;
+}
+
+uint8_t rb_write(RingBuffer* rb, uint8_t data)
+{
+    uint8_t success = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        if (rb->count < RINGBUFFER_SIZE)
+        {
+            rb->buffer[rb->head] = data;
+            rb->head = (rb->head + 1) & RB_MASK;
+            rb->count++;
+            success = 1;
+        }
+    }
+    return success;
+}
+
+uint8_t rb_read(RingBuffer* rb, uint8_t* data)
+{
+    uint8_t success = 0;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        if (rb->count > 0)
+        {
+            *data = rb->buffer[rb->tail];
+            rb->tail = (rb->tail + 1) & RB_MASK;
+            rb->count--;
+            success = 1;
+        }
+    }
+    return success;
+}
+
+uint16_t rb_available(RingBuffer* rb)
+{
+    uint16_t c;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { c = rb->count; }
+    return c;
+}
+
+uint16_t rb_free(RingBuffer* rb)
+{
+    return RINGBUFFER_SIZE - rb_available(rb);
+}
+
+void rb_clear(RingBuffer* rb)
+{
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        rb->head  = 0;
+        rb->tail  = 0;
+        rb->count = 0;
+    }
+}
+
+uint8_t rb_is_full(RingBuffer* rb)
+{
+    uint16_t c;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { c = rb->count; }
+    return (c == RINGBUFFER_SIZE);
+}
+
+====== scheduler.h ======
+
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Simple Cooperative Task Scheduler
+ * - Non-preemptive, runs in main loop context
+ * - Up to MAX_TASKS (defined in config.h, default 12)
+ * - Named tasks for easy debugging
+ * - Call scheduler_run() frequently in loop()
+ */
+void scheduler_init(void);
+uint8_t scheduler_add(void (*task)(void), uint32_t interval_ms, const char* name);
+void    scheduler_enable(uint8_t id);
+void    scheduler_disable(uint8_t id);
+void    scheduler_run(void);           // Main dispatcher — call often!
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== scheduler.c ======
+
+#include "scheduler.h"
+#include "timer00.h"     // millis()
+#include <string.h>
+#include "config.h"
+
+typedef struct {
+    void (*func)(void);
+    uint32_t interval;
+    uint32_t last_run;
+    const char* name;
+    uint8_t enabled;
+} task_t;
+
+static task_t tasks[MAX_TASKS];
+static uint8_t task_count = 0;
+
+void scheduler_init(void)
+{
+    task_count = 0;
+    memset(tasks, 0, sizeof(tasks));
+}
+
+uint8_t scheduler_add(void (*task)(void), uint32_t interval_ms, const char* name)
+{
+    if (task_count >= MAX_TASKS || task == NULL) {
+        return 255;                    // error: no slots or NULL function
+    }
+
+    uint8_t id = task_count++;
+
+    tasks[id].func     = task;
+    tasks[id].interval = interval_ms;
+    tasks[id].name     = name ? name : "Unnamed";
+    tasks[id].enabled  = 1;
+
+    // Run as soon as possible on the very first scheduler_run()
+    tasks[id].last_run = millis() - interval_ms;
+
+    return id;
+}
+
+void scheduler_enable(uint8_t id)
+{
+    if (id < task_count) tasks[id].enabled = 1;
+}
+
+void scheduler_disable(uint8_t id)
+{
+    if (id < task_count) tasks[id].enabled = 0;
+}
+
+void scheduler_run(void)
+{
+    uint32_t now = millis();
+
+    for (uint8_t i = 0; i < task_count; i++)
+    {
+        task_t *t = &tasks[i];
+        if (t->enabled && (now - t->last_run >= t->interval))
+        {
+            t->last_run = now;
+            t->func();
+        }
+    }
+}
+====== sleep.h ======
+
+#ifndef SLEEP_H
+#define SLEEP_H
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Low-Power Sleep Modes
+ * - Default (recommended): SLEEP_MODE_POWER_DOWN (deepest sleep, ~0.1 µA)
+ * - Alternative: SLEEP_MODE_IDLE (defined in config.h)
+ * 
+ * In POWER_DOWN mode BOD is automatically disabled during sleep.
+ * Wake-up sources: external interrupt (extint), pin-change (pcint), watchdog, etc.
+ */
+void sleep_init(void);
+void sleep_enter(void);     // Put CPU to sleep — call when idle
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== sleep.c ======
+
+#include "sleep.h"
+#include "bod.h"           // Required for deepest power saving
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include "config.h"
+
+void sleep_init(void)
+{
+    // Nothing to initialize — ready to use
+}
+
+void sleep_enter(void)
+{
+#ifdef SLEEP_MODE_POWER_DOWN
+    bod_disable();                    // Critical: saves ~20–30 µA
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    power_all_disable();              // Turn off ADC, timers, USART, TWI, SPI, etc.
+#else
+    set_sleep_mode(SLEEP_MODE_IDLE);  // IDLE keeps timers & some peripherals alive
+#endif
+
+    sleep_enable();
+    sleep_cpu();                      // ← CPU sleeps here
+    sleep_disable();
+
+    // === Wake-up path ===
+#ifdef SLEEP_MODE_POWER_DOWN
+    power_all_enable();               // Restore power to peripherals
+    bod_enable();                     // Re-enable Brown-Out Detection
+#endif
+}
+
+====== softuart.h ======
+
+#ifndef SOFTUART_H
+#define SOFTUART_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Software (bit-banged) UART
+ * - TX: Fully functional, blocking, reliable at SOFTUART_BAUD
+ * - RX: Placeholder (easy to upgrade later with RingBuffer + PCINT)
+ * - Uses gpio.h for full library consistency
+ * - Ideal for debug output when hardware UART is busy
+ */
+void softuart_init(void);
+
+void softuart_putc(char c);
+void softuart_puts(const char* str);
+void softuart_puts_P(const char* str);     // PROGMEM version (PSTR)
+int  softuart_printf(const char* format, ...);
+
+uint8_t softuart_available(void);   // TODO: upgrade with ringbuffer + interrupt
+char    softuart_read(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== softuart.c ======
+
+#include "softuart.h"
+#include "gpio.h"
+#include "config.h"
+#include <util/delay.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <avr/pgmspace.h>
+
+#define BIT_TIME_US (1000000UL / SOFTUART_BAUD)
+
+static uint8_t tx_pin, rx_pin;
+
+void softuart_init(void)
+{
+    tx_pin = SOFTUART_TX_PIN;
+    rx_pin = SOFTUART_RX_PIN;
+
+    gpio_pin_mode(tx_pin, OUTPUT);
+    gpio_write(tx_pin, HIGH);           // UART idle state is HIGH
+
+    gpio_pin_mode(rx_pin, INPUT_PULLUP);
+}
+
+void softuart_putc(char c)
+{
+    // Start bit
+    gpio_write(tx_pin, LOW);
+    _delay_us(BIT_TIME_US);
+
+    // 8 data bits, LSB first
+    for (uint8_t i = 0; i < 8; i++) {
+        gpio_write(tx_pin, (c & 1) ? HIGH : LOW);
+        c >>= 1;
+        _delay_us(BIT_TIME_US);
+    }
+
+    // Stop bit + small safety margin
+    gpio_write(tx_pin, HIGH);
+    _delay_us(BIT_TIME_US + (BIT_TIME_US / 2));
+}
+
+void softuart_puts(const char* str)
+{
+    while (*str) softuart_putc(*str++);
+}
+
+void softuart_puts_P(const char* str)
+{
+    char c;
+    while ((c = pgm_read_byte(str++)) != 0) {
+        softuart_putc(c);
+    }
+}
+
+int softuart_printf(const char* format, ...)
+{
+    char buffer[64];                    // Small to save RAM on AVR
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    softuart_puts(buffer);
+    return n;
+}
+
+// ====================== RX - Placeholder (easy to upgrade) ======================
+// TODO: Upgrade to interrupt-driven (PCINT or Timer) + RingBuffer when needed
+uint8_t softuart_available(void)
+{
+    return 0;
+}
+
+char softuart_read(void)
+{
+    return 0;
+}
+
+
+====== spi.h ======
+
+#ifndef SPI_H
+#define SPI_H
+#include <avr/io.h>
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Hardware SPI Master
+ * - Fully compatible with config.h (SPI_MODE, SPI_SPEED_DIV_xx, SPI_SS_PIN)
+ * - Uses gpio.h for clean pin control
+ * - Supports multiple devices via select/deselect
+ */
+void spi_init(void);
+
+uint8_t spi_transfer(uint8_t data);   // full duplex
+void    spi_write(uint8_t data);      // send only
+uint8_t spi_read(void);               // receive only (dummy 0xFF)
+
+void spi_select(uint8_t ss_pin);      // pull SS LOW
+void spi_deselect(uint8_t ss_pin);    // pull SS HIGH
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== spi.c ======
+
+#include "spi.h"
+#include "gpio.h"
+#include "config.h"
+
+void spi_init(void)
+{
+    // === Pin setup using gpio.h (consistent with entire library) ===
+    gpio_pin_mode(10, OUTPUT);                 // SS (default)
+    gpio_pin_mode(11, OUTPUT);                 // SCK  (PB5)
+    gpio_pin_mode(12, OUTPUT);                 // MOSI (PB3)  wait — Arduino numbering:
+    // Arduino pins: 10=PB2 (SS), 11=PB3 (MOSI), 12=PB4 (MISO), 13=PB5 (SCK)
+    gpio_pin_mode(13, OUTPUT);                 // SCK
+    gpio_pin_mode(11, OUTPUT);                 // MOSI
+    gpio_pin_mode(12, INPUT);                  // MISO
+
+    gpio_write(SPI_SS_PIN, HIGH);              // SS idle HIGH
+
+    // === SPI configuration ===
+    uint8_t spcr = (1 << SPE) | (1 << MSTR);   // Enable + Master
+
+    // Mode (0-3)
+    if (SPI_MODE & 1) spcr |= (1 << CPHA);
+    if (SPI_MODE & 2) spcr |= (1 << CPOL);
+
+    // Speed
+#if defined(SPI_SPEED_DIV_2)
+    SPSR |= (1 << SPI2X);
+#elif defined(SPI_SPEED_DIV_4)
+    // nothing — default /4
+#elif defined(SPI_SPEED_DIV_8)
+    SPSR |= (1 << SPI2X);
+    spcr |= (1 << SPR0);
+#elif defined(SPI_SPEED_DIV_16)
+    spcr |= (1 << SPR0);
+#elif defined(SPI_SPEED_DIV_32)
+    SPSR |= (1 << SPI2X);
+    spcr |= (1 << SPR1);
+#elif defined(SPI_SPEED_DIV_64)
+    spcr |= (1 << SPR1);
+#elif defined(SPI_SPEED_DIV_128)
+    spcr |= (1 << SPR1) | (1 << SPR0);
+#else
+    spcr |= (1 << SPR0);                       // default /16
+#endif
+
+    SPCR = spcr;
+}
+
+uint8_t spi_transfer(uint8_t data)
+{
+    SPDR = data;
+    while (!(SPSR & (1 << SPIF)));
+    return SPDR;
+}
+
+void spi_write(uint8_t data)
+{
+    spi_transfer(data);
+}
+
+uint8_t spi_read(void)
+{
+    return spi_transfer(0xFF);
+}
+
+// ====================== Chip Select Helpers ======================
+
+void spi_select(uint8_t ss_pin)
+{
+    gpio_write(ss_pin, LOW);
+}
+
+void spi_deselect(uint8_t ss_pin)
+{
+    gpio_write(ss_pin, HIGH);
+}
+
+====== temp.h ======
+
+#ifndef TEMP_H
+#define TEMP_H
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Internal AVR Temperature Sensor (ATmega328P)
+ * - ADC channel 8 with 1.1 V internal bandgap reference
+ * - Calibration constants from config.h (TEMP_CAL_OFFSET / TEMP_CAL_SLOPE)
+ * - Fully compatible with adc_freerun / adc_read() — restores ADMUX after use
+ */
+void   temp_init(void);
+float  temp_read_celsius(void);
+int8_t temp_read_int(void);      // rounded to nearest degree
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== temp.c ======
+
+#include "temp.h"
+#include "adc.h"
+#include "config.h"
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+
+void temp_init(void)
+{
+    adc_init();        // Ensure ADC is enabled + prescaler set
+}
+
+float temp_read_celsius(void)
+{
+    uint8_t saved_admux = ADMUX;
+    uint8_t sreg = SREG;
+
+    // === Switch to temperature sensor configuration ===
+    cli();
+    ADMUX = (1 << REFS1) | (1 << REFS0) | 8;   // 1.1 V ref + channel 8
+    SREG = sreg;                               // allow interrupts during delay
+
+    _delay_us(120);                            // Reference stabilization (datasheet)
+
+    ADCSRA |= (1 << ADSC);                     // Start conversion
+    while (ADCSRA & (1 << ADSC));              // Wait for completion
+
+    uint16_t adc = ADC;
+
+    // === Restore previous ADC settings (critical!) ===
+    sreg = SREG;
+    cli();
+    ADMUX = saved_admux;
+    SREG = sreg;
+
+    return (adc - TEMP_CAL_OFFSET) / TEMP_CAL_SLOPE;
+}
+
+int8_t temp_read_int(void)
+{
+    float t = temp_read_celsius();
+    return (int8_t)(t + (t >= 0.0f ? 0.5f : -0.5f));   // proper rounding
+}
+
+====== timer00.h ======
+
+#ifndef TIMER00_H
+#define TIMER00_H
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Timer0 — System Time + PWM (Arduino-compatible)
+ * - millis() / micros() / delay_ms() with sub-millisecond accuracy
+ * - Fast PWM 8-bit on pins 5 (OC0B) and 6 (OC0A)
+ * - Used by: scheduler, ledstatus, debounce, hw_random, pwm.h
+ */
+void timer0_init(void);
+
+uint32_t millis(void);
+uint32_t micros(void);
+void     delay_ms(uint32_t ms);
+
+// PWM helpers (used by pwm.h)
+void timer0_pwmA(uint8_t duty);   // Pin 6  (OC0A)
+void timer0_pwmB(uint8_t duty);   // Pin 5  (OC0B)
+
+// Backward compatibility during transition
+#define my_millis   millis
+#define my_micros   micros
+#define my_delay_ms delay_ms
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== timer00.c ======
+
+#include "timer00.h"
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+
+volatile uint32_t timer0_millis = 0;
+volatile uint8_t  timer0_fract  = 0;
+volatile uint32_t timer0_overflow_count = 0;   // for accurate micros()
+
+ISR(TIMER0_OVF_vect)
+{
+    uint32_t m = timer0_millis;
+    uint8_t  f = timer0_fract;
+
+    // 16 MHz / 64 / 256 = 1024 µs per overflow
+    m += 1;
+    f += 24;                    // 24/256 ≈ 0.09375 ms extra → averages exactly 1 ms
+    if (f >= 256) {
+        f -= 256;
+        m += 1;
+    }
+
+    timer0_millis = m;
+    timer0_fract  = f;
+    timer0_overflow_count++;
+}
+
+void timer0_init(void)
+{
+    // Fast PWM 8-bit, non-inverting on OC0A & OC0B, prescaler /64
+    TCCR0A = (1 << WGM01) | (1 << WGM00) | (1 << COM0A1) | (1 << COM0B1);
+    TCCR0B = (1 << CS01) | (1 << CS00);   // /64
+
+    TIMSK0 |= (1 << TOIE0);               // Overflow interrupt for millis
+
+    timer0_millis = 0;
+    timer0_fract  = 0;
+    timer0_overflow_count = 0;
+}
+
+uint32_t millis(void)
+{
+    uint32_t m;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        m = timer0_millis;
+    }
+    return m;
+}
+
+uint32_t micros(void)
+{
+    uint32_t m;
+    uint8_t t;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        m = timer0_millis;
+        t = TCNT0;
+
+        // Handle case where overflow just happened but interrupt not yet serviced
+        if ((TIFR0 & (1 << TOV0)) && t == 0) {
+            m++;
+        }
+    }
+
+    return (m * 1000UL) + ((uint32_t)t * 4UL);   // 4 µs per tick
+}
+
+void delay_ms(uint32_t ms)
+{
+    uint32_t start = millis();
+    while (millis() - start < ms);
+}
+
+void timer0_pwmA(uint8_t duty)
+{
+    if (duty == 0) {
+        TCCR0A &= ~(1 << COM0A1);
+    } else {
+        TCCR0A = (TCCR0A & ~(1 << COM0A0)) | (1 << COM0A1);  // non-inverting
+        OCR0A = duty;
+    }
+}
+
+void timer0_pwmB(uint8_t duty)
+{
+    if (duty == 0) {
+        TCCR0A &= ~(1 << COM0B1);
+    } else {
+        TCCR0A = (TCCR0A & ~(1 << COM0B0)) | (1 << COM0B1);  // non-inverting
+        OCR0B = duty;
+    }
+}
+
+====== timer1.h ======
+
+#ifndef TIMER1_H
+#define TIMER1_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Timer1 — 16-bit Timer with 10-bit PWM
+ * - Fast PWM mode (TOP = 1023, 10-bit resolution)
+ * - Pins: 9 (OC1A), 10 (OC1B)
+ * - Prescaler from config.h (TIMER1_PRESCALER_xx)
+ * - Used by pwm_write() for pins 9 & 10
+ */
+void timer1_init(void);
+
+void timer1_pwmA(uint16_t duty);   // Pin 9  (OC1A) — 0..1023
+void timer1_pwmB(uint16_t duty);   // Pin 10 (OC1B) — 0..1023
+
+void timer1_disable_pwm(void);
+
+uint16_t timer1_get_count(void);   // Read current TCNT1 value
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+======= timer1.c ======
+
+#include "timer1.h"
+#include "gpio.h"
+#include "config.h"
+#include <avr/io.h>
+
+void timer1_init(void)
+{
+    // Set PWM pins as outputs using gpio.h (full library consistency)
+    gpio_pin_mode(9,  OUTPUT);   // OC1A
+    gpio_pin_mode(10, OUTPUT);   // OC1B
+
+    // Fast PWM 10-bit (mode 7), non-inverting on both channels
+    TCCR1A = (1 << WGM11) | (1 << WGM10) | (1 << COM1A1) | (1 << COM1B1);
+    TCCR1B = (1 << WGM12);
+
+    // Prescaler from config.h (exactly matches timer00 style)
+#if defined(TIMER1_PRESCALER_1)
+    TCCR1B |= (1 << CS10);
+#elif defined(TIMER1_PRESCALER_8)
+    TCCR1B |= (1 << CS11);
+#elif defined(TIMER1_PRESCALER_64)
+    TCCR1B |= (1 << CS11) | (1 << CS10);
+#elif defined(TIMER1_PRESCALER_256)
+    TCCR1B |= (1 << CS12);
+#elif defined(TIMER1_PRESCALER_1024)
+    TCCR1B |= (1 << CS12) | (1 << CS10);
+#else
+    TCCR1B |= (1 << CS11) | (1 << CS10);   // default /64
+#endif
+
+    OCR1A = 0;
+    OCR1B = 0;
+}
+
+void timer1_pwmA(uint16_t duty)
+{
+    if (duty > 1023) duty = 1023;
+
+    if (duty == 0) {
+        TCCR1A &= ~(1 << COM1A1);          // disable output
+    } else {
+        TCCR1A = (TCCR1A & ~(1 << COM1A0)) | (1 << COM1A1);  // non-inverting
+        OCR1A = duty;
+    }
+}
+
+void timer1_pwmB(uint16_t duty)
+{
+    if (duty > 1023) duty = 1023;
+
+    if (duty == 0) {
+        TCCR1A &= ~(1 << COM1B1);
+    } else {
+        TCCR1A = (TCCR1A & ~(1 << COM1B0)) | (1 << COM1B1);  // non-inverting
+        OCR1B = duty;
+    }
+}
+
+void timer1_disable_pwm(void)
+{
+    TCCR1A &= ~((1 << COM1A1) | (1 << COM1B1));
+}
+
+uint16_t timer1_get_count(void)
+{
+    return TCNT1;
+}
+
+====== timer2.h ======
+
+#ifndef TIMER2_H
+#define TIMER2_H
+#include <stdint.h>
+#include "config.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Timer2 — 8-bit Timer with PWM + optional async crystal
+ * - Fast PWM 8-bit (0–255 resolution)
+ * - Pins: 11 (OC2A / PB3), 3 (OC2B / PD3)
+ * - Prescaler from config.h (TIMER2_PRESCALER_xx)
+ * - Optional TIMER2_USE_ASYNC (32.768 kHz crystal on TOSC1/TOSC2)
+ * - Used by pwm.h for pins 3 and 11
+ */
+void timer2_init(void);
+
+void timer2_pwmA(uint8_t duty);   // Pin 11 (OC2A) — 0..255
+void timer2_pwmB(uint8_t duty);   // Pin 3  (OC2B) — 0..255
+
+void timer2_disable_pwm(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== timer2.c ======
+
+#include "timer2.h"
+#include "gpio.h"
+#include "config.h"
+#include <avr/io.h>
+
+void timer2_init(void)
+{
+    // Set PWM pins as outputs using gpio.h (full library consistency)
+    gpio_pin_mode(11, OUTPUT);   // OC2A - PB3 (pin 11)
+    gpio_pin_mode(3,  OUTPUT);   // OC2B - PD3 (pin 3)
+
+    // Fast PWM 8-bit (mode 3), non-inverting on both channels
+    TCCR2A = (1 << WGM21) | (1 << WGM20) | (1 << COM2A1) | (1 << COM2B1);
+
+#ifdef TIMER2_USE_ASYNC
+    ASSR |= (1 << AS2);          // Use external 32.768 kHz crystal
+    // Wait for async registers to synchronize
+    while (ASSR & ((1<<TCN2UB)|(1<<OCR2AUB)|(1<<OCR2BUB)|(1<<TCR2AUB)|(1<<TCR2BUB)));
+#endif
+
+    // Prescaler from config.h
+#if defined(TIMER2_PRESCALER_1)
+    TCCR2B = (1 << CS20);
+#elif defined(TIMER2_PRESCALER_8)
+    TCCR2B = (1 << CS21);
+#elif defined(TIMER2_PRESCALER_32)
+    TCCR2B = (1 << CS21) | (1 << CS20);
+#elif defined(TIMER2_PRESCALER_64)
+    TCCR2B = (1 << CS22);
+#elif defined(TIMER2_PRESCALER_128)
+    TCCR2B = (1 << CS22) | (1 << CS20);
+#elif defined(TIMER2_PRESCALER_256)
+    TCCR2B = (1 << CS22) | (1 << CS21);
+#else
+    TCCR2B = (1 << CS22);        // default /64 (matches config.h)
+#endif
+
+    OCR2A = 0;
+    OCR2B = 0;
+}
+
+void timer2_pwmA(uint8_t duty)
+{
+    if (duty > 255) duty = 255;
+
+    if (duty == 0) {
+        TCCR2A &= ~(1 << COM2A1);           // disconnect pin (clean off)
+    } else {
+        TCCR2A = (TCCR2A & ~(1 << COM2A0)) | (1 << COM2A1); // non-inverting
+        OCR2A = duty;
+    }
+}
+
+void timer2_pwmB(uint8_t duty)
+{
+    if (duty > 255) duty = 255;
+
+    if (duty == 0) {
+        TCCR2A &= ~(1 << COM2B1);
+    } else {
+        TCCR2A = (TCCR2A & ~(1 << COM2B0)) | (1 << COM2B1); // non-inverting
+        OCR2B = duty;
+    }
+}
+
+void timer2_disable_pwm(void)
+{
+    TCCR2A &= ~((1 << COM2A1) | (1 << COM2B1));
+}
+
+====== uart.h ======
+
+#ifndef UART_H
+#define UART_H
+#include <avr/io.h>
+#include <avr/pgmspace.h>
+#include <stdint.h>
+#include "config.h"
+#include "ringbuffer.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Hardware USART0 (UART)
+ * - 8N1 format, configurable baud in config.h
+ * - TX: fast blocking
+ * - RX: fully interrupt-driven with RingBuffer (lock-free, ISR-safe)
+ * - Consistent API with softuart.h
+ */
+void uart_init(void);
+
+void uart_putchar(char c);
+void uart_puts(const char* str);
+void uart_puts_P(const char* str);      // PROGMEM version (PSTR)
+int  uart_printf(const char* format, ...);
+
+uint8_t uart_available(void);
+char    uart_read(void);                // returns 0 if empty
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== uart.c ======
+
+#include "uart.h"
+#include "gpio.h"
+#include "ringbuffer.h"
+#include "config.h"
+#include <stdarg.h>
+#include <stdio.h>
+
+static RingBuffer uart_rx_buf;
+
+void uart_init(void)
+{
+    // Pin setup using gpio.h (full library consistency)
+    gpio_pin_mode(0, INPUT);      // RXD0  (PD0)
+    gpio_pin_mode(1, OUTPUT);     // TXD0  (PD1)
+
+    uint16_t ubrr = F_CPU / 16 / BAUD_RATE - 1;
+    UBRR0H = (uint8_t)(ubrr >> 8);
+    UBRR0L = (uint8_t)ubrr;
+
+    rb_init(&uart_rx_buf);
+
+    // Enable TX, RX, and RX interrupt
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);   // 8N1
+}
+
+void uart_putchar(char c)
+{
+    while (!(UCSR0A & (1 << UDRE0)));   // wait for transmit buffer empty
+    UDR0 = c;
+}
+
+void uart_puts(const char* str)
+{
+    while (*str) uart_putchar(*str++);
+}
+
+void uart_puts_P(const char* str)
+{
+    char c;
+    while ((c = pgm_read_byte(str++)) != 0) {
+        uart_putchar(c);
+    }
+}
+
+int uart_printf(const char* format, ...)
+{
+    char buffer[64];                    // small to save SRAM
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    uart_puts(buffer);
+    return len;
+}
+
+// ====================== RX Functions ======================
+
+uint8_t uart_available(void)
+{
+    return rb_available(&uart_rx_buf);
+}
+
+char uart_read(void)
+{
+    char c = 0;
+    rb_read(&uart_rx_buf, (uint8_t*)&c);
+    return c;
+}
+
+// ====================== ISR ======================
+
+ISR(USART_RX_vect)
+{
+    uint8_t data = UDR0;
+    rb_write(&uart_rx_buf, data);   // ringbuffer is atomic
+}
+
+====== watchdog.h ======
+
+#ifndef WATCHDOG_H
+#define WATCHDOG_H
+#include "config.h"
+#include <avr/wdt.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Watchdog Timer
+ * - Timeout set in config.h (WATCHDOG_TIMEOUT_xx)
+ * - Call watchdog_reset() regularly (e.g. in scheduler_run() or main loop)
+ * - Automatically used by bootloader_jump() for safe reset
+ * - Disable before deep sleep if you want maximum power saving
+ */
+void watchdog_init(void);      // Arm the watchdog
+void watchdog_reset(void);     // Feed the dog ("pet the dog")
+void watchdog_disable(void);   // Turn off (safe before sleep or bootloader)
+
+#ifdef __cplusplus
+}
+#endif
+#endif
+
+====== watchdog.c ======
+
+#include "watchdog.h"
+#include "config.h"
+#include <avr/wdt.h>
+
+void watchdog_init(void)
+{
+    uint8_t wdt_period;
+
+#if defined(WATCHDOG_TIMEOUT_15MS)
+    wdt_period = WDTO_15MS;
+#elif defined(WATCHDOG_TIMEOUT_30MS)
+    wdt_period = WDTO_30MS;
+#elif defined(WATCHDOG_TIMEOUT_60MS)
+    wdt_period = WDTO_60MS;
+#elif defined(WATCHDOG_TIMEOUT_120MS)
+    wdt_period = WDTO_120MS;
+#elif defined(WATCHDOG_TIMEOUT_250MS)
+    wdt_period = WDTO_250MS;
+#elif defined(WATCHDOG_TIMEOUT_500MS)
+    wdt_period = WDTO_500MS;
+#elif defined(WATCHDOG_TIMEOUT_1S)
+    wdt_period = WDTO_1S;
+#elif defined(WATCHDOG_TIMEOUT_2S)
+    wdt_period = WDTO_2S;
+#elif defined(WATCHDOG_TIMEOUT_4S)
+    wdt_period = WDTO_4S;
+#elif defined(WATCHDOG_TIMEOUT_8S)
+    wdt_period = WDTO_8S;
+#else
+    wdt_period = WDTO_2S;          // safe default
+#endif
+
+    wdt_enable(wdt_period);
+}
+
+void watchdog_reset(void)
+{
+    wdt_reset();                   // "pet the dog"
+}
+
+void watchdog_disable(void)
+{
+    wdt_disable();
+}

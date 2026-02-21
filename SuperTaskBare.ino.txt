@@ -1,0 +1,64 @@
+#include "config.h"
+#include "uart.h"
+#include "adc.h"
+#include "gpio.h"
+#include "clock.h"
+#include "spi.h"
+#include "i2c.h"
+#include "comparator.h"
+#include "timer0.h"
+#include "timer1.h"
+#include "timer2.h"
+#include "pwm.h"
+#include "extint.h"
+#include "pcint.h"
+#include "eeprom.h"
+#include "watchdog.h"                          // ← New puzzle #16
+
+volatile uint32_t button_presses = 0;
+volatile uint32_t button2_presses = 0;
+
+void button_pressed(void)  { button_presses++;  gpio_toggle(LED_PIN); }
+void button2_pressed(void) { button2_presses++; gpio_toggle(LED_PIN); }
+
+void setup() {
+    clock_init();
+    timer0_init();
+    uart_init();
+    adc_init();
+    spi_init();
+    i2c_init();
+    comparator_init();
+    timer1_init();
+    timer2_init();
+    pwm_init();
+    extint_init();
+    pcint_init();
+
+    gpio_pin_mode(LED_PIN, OUTPUT);
+    gpio_pin_mode(BUTTON_PIN, INPUT_PULLUP);
+    gpio_pin_mode(BUTTON2_PIN, INPUT_PULLUP);
+
+    extint_attach(EXTINT0, EXTINT_FALLING, button_pressed);
+    pcint_attach(BUTTON2_PIN, button2_pressed);
+
+    watchdog_init();                           // ← Arm the watchdog
+
+    uint16_t boots = eeprom_get_boot_count();
+    eeprom_increment_boot_count();
+
+    uart_puts_P(PSTR("\n=== Puzzle 16 - WATCHDOG TIMER READY ===\n"));
+    uart_printf("This is boot #%u\n", boots + 1);
+    uart_puts_P(PSTR("Watchdog armed (2 seconds). It will auto-reset if not fed!\n"));
+}
+
+void loop() {
+    watchdog_reset();                          // ← MUST call regularly or board resets!
+
+    static uint32_t last_print = 0;
+    if (millis() - last_print >= 1000) {
+        last_print = millis();
+        uart_printf("Uptime: %lu s | EXTINT: %lu | PCINT: %lu\n",
+                    millis()/1000, button_presses, button2_presses);
+    }
+}
