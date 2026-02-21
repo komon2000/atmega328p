@@ -1,4 +1,47 @@
 #ifndef CONFIG_H
+/* =============================================================================
+ *  PIN USAGE & CONFLICT TABLE  (copy-paste this into config.h)
+ * =============================================================================
+ *
+ *  Arduino | AVR   | Functions                              | Major Conflicts
+ *  --------|-------|----------------------------------------|------------------------
+ *  D0      | PD0   | UART RX                                | -
+ *  D1      | PD1   | UART TX                                | -
+ *  D2      | PD2   | INT0, PCINT18                          | -
+ *  D3      | PD3   | PWM (OC2B)                             | Timer2 PWM
+ *  D4      | PD4   | -                                      | -
+ *  D5      | PD5   | PWM (OC0B)                             | Timer0 (breaks millis/scheduler!)
+ *  D6      | PD6   | PWM (OC0A)                             | Timer0 (breaks millis/scheduler!)
+ *  D7      | PD7   | -                                      | -
+ *  D8      | PB0   | PCINT0                                 | -
+ *  D9      | PB1   | PWM (OC1A)                             | Timer1 PWM
+ *  D10     | PB2   | SPI SS / PWM (OC1B)                    | **SPI + Timer1 PWM**
+ *  D11     | PB3   | SPI MOSI / PWM (OC2A)                  | **SPI + Timer2 PWM**
+ *  D12     | PB4   | SPI MISO                               | SPI
+ *  D13     | PB5   | SPI SCK                                | SPI
+ *  A0      | PC0   | ADC0                                   | ADC
+ *  A1      | PC1   | ADC1                                   | ADC
+ *  A2      | PC2   | ADC2                                   | ADC
+ *  A3      | PC3   | ADC3                                   | ADC
+ *  A4      | PC4   | ADC4 / I2C SDA                         | **ADC + I2C**
+ *  A5      | PC5   | ADC5 / I2C SCL                         | **ADC + I2C**
+ *
+ *  CRITICAL RULES:
+ *   - SPI cannot share pins 10 or 11 with PWM.
+ *   - I2C (A4/A5) cannot be used as normal ADC at the same time.
+ *   - Timer0 PWM (D5/D6) destroys any millis()/delay()-based code.
+ *   - Sleep/power-save turns peripherals off – must re-init after wake.
+ *
+ *  Feature enable flags (set 1/0) – used for future compile checks:
+ */
+#define USE_UART          1
+#define USE_SPI           0
+#define USE_I2C           1
+#define USE_ADC           1
+#define USE_TIMER0_PWM    0     // set 1 only if you don't use timing functions
+#define USE_TIMER1_PWM    1
+#define USE_TIMER2_PWM    1
+#define USE_SLEEP         0
 #define CONFIG_H
 
 // ====================== REQUIRED SYSTEM HEADERS ======================
